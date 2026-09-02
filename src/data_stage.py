@@ -1,10 +1,17 @@
-import hashlib, gc
+import hashlib, gc, os, shutil
 from pathlib import Path
 import numpy as np
 import pandas as pd
 from datasets import Dataset, concatenate_datasets, load_dataset, load_from_disk
 from config import *
 from common import atomic_json
+
+
+def save_dataset_atomic(dataset, path):
+    path=Path(path); path.parent.mkdir(parents=True,exist_ok=True); temp=path.parent/f'.tmp_{path.name}_{os.getpid()}'
+    shutil.rmtree(temp,ignore_errors=True); dataset.save_to_disk(str(temp))
+    if path.exists(): shutil.rmtree(path,ignore_errors=True)
+    temp.rename(path)
 
 def unique_indices(raw):
     seen=set(); out=[]
@@ -62,17 +69,17 @@ def prepare(p, tokenizer, vocab_size, separator):
             if out.exists(): continue
             blocks=pack(raw,files,TEACHER_BLOCKS_PER_DOMAIN,tokenizer,vocab_size,separator)
             if len(blocks)!=TEACHER_BLOCKS_PER_DOMAIN: raise RuntimeError(f'T{t}/{name}: only {len(blocks)} blocks')
-            Dataset.from_dict({'input_ids':blocks,'domain_id':[d]*len(blocks)}).save_to_disk(str(out)); print(f'[data] T{t}/{name}: {len(blocks)} blocks')
+            save_dataset_atomic(Dataset.from_dict({'input_ids':blocks,'domain_id':[d]*len(blocks)}),out); print(f'[data] T{t}/{name}: {len(blocks)} blocks')
         sout=p['parts']/f'student_domain_{d}'
         if not sout.exists():
             blocks=pack(raw,spool,STUDENT_BLOCKS_PER_DOMAIN,tokenizer,vocab_size,separator)
             if len(blocks)!=STUDENT_BLOCKS_PER_DOMAIN: raise RuntimeError(f'{name}: insufficient student blocks')
-            Dataset.from_dict({'input_ids':blocks,'domain_id':[d]*len(blocks)}).save_to_disk(str(sout))
+            save_dataset_atomic(Dataset.from_dict({'input_ids':blocks,'domain_id':[d]*len(blocks)}),sout)
         vout=p['parts']/f'validation_domain_{d}'
         if not vout.exists():
             blocks=pack(raw,vpool,VAL_BLOCKS_PER_DOMAIN,tokenizer,vocab_size,separator)
             if len(blocks)!=VAL_BLOCKS_PER_DOMAIN: raise RuntimeError(f'{name}: insufficient validation blocks')
-            Dataset.from_dict({'input_ids':blocks,'domain_id':[d]*len(blocks)}).save_to_disk(str(vout))
+            save_dataset_atomic(Dataset.from_dict({'input_ids':blocks,'domain_id':[d]*len(blocks)}),vout)
         atomic_json(marker,{'domain':name,'raw_files':len(raw),'unique_files':n,'teacher_pool_files':len(tpool),'student_pool_files':len(spool),'validation_pool_files':len(vpool)})
         del raw,unique,order,tpool,spool,vpool,bins; gc.collect()
     for t in range(NUM_TEACHERS):
@@ -81,7 +88,7 @@ def prepare(p, tokenizer, vocab_size, separator):
         parts=[load_from_disk(str(p['parts']/f'teacher_{t}_domain_{d}')) for d in range(NUM_DOMAINS)]
         ds=concatenate_datasets(parts); counts=np.bincount(np.asarray(ds['domain_id']),minlength=NUM_DOMAINS)
         if not np.all(counts==TEACHER_BLOCKS_PER_DOMAIN): raise RuntimeError(f'T{t} balance failed')
-        ds.shuffle(seed=SEED+50000+t).save_to_disk(str(out)); print(f'[data] teacher {t}: {len(ds):,} blocks')
+        save_dataset_atomic(ds.shuffle(seed=SEED+50000+t),out); print(f'[data] teacher {t}: {len(ds):,} blocks')
     student_parts=[]
     for d in range(NUM_DOMAINS): student_parts.append(load_from_disk(str(p['parts']/f'student_domain_{d}')).shuffle(seed=SEED+60000+d))
     ordered=[]
@@ -92,9 +99,9 @@ def prepare(p, tokenizer, vocab_size, separator):
     for step in range(STUDENT_MAX_STEPS):
         ids=np.asarray(student[step*STUDENT_GRAD_ACCUM:(step+1)*STUDENT_GRAD_ACCUM]['domain_id']); counts=np.bincount(ids,minlength=NUM_DOMAINS)
         if not np.all(counts==2): raise RuntimeError('student batch balance failure')
-    student.save_to_disk(str(p['student_data']))
+    save_dataset_atomic(student,p['student_data'])
     val_parts=[load_from_disk(str(p['parts']/f'validation_domain_{d}')) for d in range(NUM_DOMAINS)]
-    val=concatenate_datasets(val_parts).shuffle(seed=SEED+70000); val.save_to_disk(str(p['val_data']))
+    val=concatenate_datasets(val_parts).shuffle(seed=SEED+70000); save_dataset_atomic(val,p['val_data'])
     audit=[]
     for t in range(NUM_TEACHERS):
         ds=load_from_disk(str(p['data']/f'teacher_{t}')); counts=np.bincount(np.asarray(ds['domain_id']),minlength=NUM_DOMAINS)
