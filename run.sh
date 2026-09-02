@@ -9,6 +9,8 @@ VENV_DIR="$SCRIPT_DIR/.venv"
 LOG_DIR="$STATE_DIR/logs"
 FINISHED_MARKER="$STATE_DIR/EXPERIMENT_FINISHED.json"
 MAX_RESTARTS="${EXPERIMENT_MAX_RESTARTS:-5}"
+DRIVER_INSTALLER_URL="https://storage.googleapis.com/compute-gpu-installation-us/installer/latest/cuda_installer.pyz"
+DRIVER_INSTALLER="$STATE_DIR/tmp/cuda_installer.pyz"
 
 mkdir -p "$STATE_DIR" "$LOG_DIR" "$STATE_DIR/tmp" "$STATE_DIR/hf_cache"
 
@@ -17,17 +19,82 @@ if [[ -f "$FINISHED_MARKER" ]]; then
   exit 0
 fi
 
-if ! command -v nvidia-smi >/dev/null 2>&1; then
-  echo "ERROR: nvidia-smi was not found."
-  echo "Create the VM with an NVIDIA driver installed (recommended: a GPU/Deep Learning VM image), then rerun ./run.sh."
-  exit 2
-fi
+have_sudo() {
+  command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1
+}
 
-if ! nvidia-smi -L >/dev/null 2>&1; then
-  echo "ERROR: NVIDIA GPU/driver is not ready."
-  echo "Wait for driver installation/reboot to finish, verify 'nvidia-smi', then rerun ./run.sh."
-  exit 2
-fi
+install_base_packages_if_needed() {
+  local missing=0
+  for cmd in python3 curl lspci; do
+    command -v "$cmd" >/dev/null 2>&1 || missing=1
+  done
+  if [[ $missing -eq 0 ]]; then
+    return 0
+  fi
+  if ! have_sudo; then
+    echo "ERROR: base packages are missing and passwordless sudo is unavailable."
+    exit 2
+  fi
+  echo "Installing base VM packages..."
+  sudo apt-get update
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    python3 python3-pip python3-venv curl ca-certificates pciutils git build-essential
+}
+
+ensure_nvidia_driver() {
+  # Fast path: driver already works.
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+    return 0
+  fi
+
+  install_base_packages_if_needed
+
+  # Installing a driver cannot create a GPU. Fail clearly if the VM has no NVIDIA PCI device.
+  if ! lspci | grep -Eqi 'NVIDIA|3D controller.*NVIDIA|VGA compatible controller.*NVIDIA'; then
+    echo "ERROR: no NVIDIA GPU is attached to this VM."
+    echo "Stop the VM, attach an NVIDIA T4, start it again, then rerun ./run.sh."
+    exit 2
+  fi
+
+  if ! have_sudo; then
+    echo "ERROR: NVIDIA driver is missing and passwordless sudo is unavailable."
+    exit 2
+  fi
+
+  echo "NVIDIA GPU detected, but the driver is not usable."
+  echo "Installing the driver with Google Cloud's official GPU installer..."
+
+  # The Ops Agent can hold NVIDIA libraries open during driver installation.
+  sudo systemctl stop google-cloud-ops-agent >/dev/null 2>&1 || true
+
+  curl -fL --retry 5 --retry-delay 2 \
+    "$DRIVER_INSTALLER_URL" \
+    -o "$DRIVER_INSTALLER"
+
+  sudo python3 "$DRIVER_INSTALLER" install_driver
+
+  # Some images load the driver immediately; others need one reboot after kernel/module changes.
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+    echo "NVIDIA driver installed successfully."
+    sudo systemctl start google-cloud-ops-agent >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  touch "$STATE_DIR/DRIVER_REBOOT_REQUIRED"
+  echo
+  echo "NVIDIA driver installation completed, but the kernel module is not active yet."
+  echo "A one-time reboot is required. Run:"
+  echo
+  echo "    sudo reboot"
+  echo
+  echo "After reconnecting, return to this repository and run ./run.sh again."
+  echo "No experiment progress has been lost."
+  exit 20
+}
+
+install_base_packages_if_needed
+ensure_nvidia_driver
+rm -f "$STATE_DIR/DRIVER_REBOOT_REQUIRED" 2>/dev/null || true
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "ERROR: python3 is not installed."
@@ -37,13 +104,13 @@ fi
 if [[ ! -d "$VENV_DIR" ]]; then
   echo "Creating virtual environment..."
   if ! python3 -m venv "$VENV_DIR"; then
-    if command -v sudo >/dev/null 2>&1; then
+    if have_sudo; then
       echo "Installing python3-venv..."
       sudo apt-get update
-      sudo apt-get install -y python3-venv python3-pip
+      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv python3-pip
       python3 -m venv "$VENV_DIR"
     else
-      echo "ERROR: python3 -m venv failed and sudo is unavailable."
+      echo "ERROR: python3 -m venv failed and passwordless sudo is unavailable."
       exit 2
     fi
   fi
